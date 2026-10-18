@@ -1,0 +1,9 @@
+build/
+build_public/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.dll
+*.exe
+vrlog*.txt

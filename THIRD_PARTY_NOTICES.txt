@@ -1,0 +1,6 @@
+enshrouded_vr/openxr_loader.dll — Khronos OpenXR Loader 1.1.63 (NuGet OpenXR.Loader)
+
+Copyright (c) The Khronos Group Inc. License: Apache-2.0 OR MIT. https://github.com/KhronosGroup/OpenXR-SDK
+
+src/third_party/vulkan — Khronos Vulkan-Headers. Copyright (c) The Khronos Group Inc. License: Apache-2.0 OR MIT. https://github.com/KhronosGroup/Vulkan-Headers
+src/third_party/openxr — Khronos OpenXR SDK headers. Copyright (c) The Khronos Group Inc. License: Apache-2.0 OR MIT. https://github.com/KhronosGroup/OpenXR-SDK
