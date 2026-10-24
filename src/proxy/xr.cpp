@@ -6,6 +6,8 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #include "xr.h"
+#include "post_comp.h"
+#include "mvfix.h"   // v1.1.1: CAS + colour post pass (SPIR-V from shaders/post.comp via tools/spv2h.py)
 #define XR_NO_PROTOTYPES
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
@@ -31,7 +33,11 @@ void hwbp_trace(const uintptr_t* addr, const int* len, const char* const* names,
 struct CamFields { uint32_t yaw, pitch, roll, pivot, eyepos, basis, offset; const char* build; uint32_t aspect, fov, fov_deg_setting; uint32_t fov_copies[3]; };
 const CamFields* camhook_fields();
 void cap_arm();
+void dlss_set_device(void*); bool dlss_ok(); void dlss_set_mode(int); int dlss_mode(); int dlss_last_slot();
+bool s12_dump_start(int); void dlss_set_pre(void* (*)(void*, void*, const float*, int), int (*)()); void dlss_mv_stats(uint64_t*, uint64_t*);
+void dlss_stats(uint64_t*, uint64_t*, uint64_t*, uint64_t*, float*);
 bool osd_render(const wchar_t* text, int w, int h, uint8_t* out);
+uint32_t g_sc_usage = 0;   // game swapchain imageUsage (set by Hk_CreateSwapchain); post pass needs STORAGE
 std::atomic<int> g_hud_redirect{0}; std::atomic<uint64_t> g_hud_passes{0};
 
 namespace {
@@ -49,12 +55,15 @@ PFN_xrGetInstanceProcAddr xrGIPA = nullptr;
     X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCreateFence) X(vkWaitForFences) \
     X(vkResetFences) X(vkCreateSemaphore) X(vkQueueSubmit) \
     X(vkCreateBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCmdCopyBufferToImage) \
-    X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView)
+    X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) \
+    X(vkCreateShaderModule) X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateComputePipelines) \
+    X(vkCreateDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
+    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch)
 #define VDECL(n) PFN_##n p_##n = nullptr;
 VK_FUNCS(VDECL)
 
 constexpr int kSlots = 6;
-constexpr int kNumActs = 24, kOW = 768, kOH = 96;   // hotkey actions; OSD panel texture
+constexpr int kNumActs = 27, kOW = 768, kOH = 96;   // hotkey actions; OSD panel texture
 struct Slot { VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; VkSemaphore sem = VK_NULL_HANDLE; bool used = false; };
 struct GameSc { uint32_t w = 0, h = 0; VkFormat fmt = VK_FORMAT_UNDEFINED; std::vector<VkImage> imgs; };
 
@@ -72,6 +81,13 @@ struct State {
     uint64_t pairs_ok = 0, pairs_broken = 0, pair_holds = 0;
     // S8a-2: one XR frame per PAIR -> the L present skips xrWaitFrame/Begin/End, game free-runs at 2x HMD rate
     int layer_eyefov = 1; bool efov_ok = false; XrFovf efov[2] = {};
+    // v1.1.1 post pass (S12): game image -> CAS/colour compute -> pimg (UNORM) -> bitwise copy to the XR swapchain
+    uint64_t dlss_eq = 0, dlss_ne = 0, dlss_calls_prev = 0;
+    int dlss_fix = 1;
+    int post_sharp = 0, post_contrast = 100, post_sat = 100, post_bright = 100; bool pfailed = false; uint64_t post_frames = 0;
+    VkShaderModule psm = VK_NULL_HANDLE; VkDescriptorSetLayout pdsl = VK_NULL_HANDLE; VkPipelineLayout ppl = VK_NULL_HANDLE; VkPipeline ppipe = VK_NULL_HANDLE;
+    VkDescriptorPool ppool = VK_NULL_HANDLE; VkImage pimg = VK_NULL_HANDLE; VkImageView pview = VK_NULL_HANDLE; uint32_t pw = 0, ph = 0;
+    VkImage pkey = VK_NULL_HANDLE; std::vector<VkDescriptorSet> pds;
     int mat_proj = 1; float mat_tu = 0.f, mat_tr = 0.f; int cam_dist_pct = 100; float cam_dist = 0.f; int pair_rate = 1; bool pairing_prev = false, cur_last = true; XrTime last_pdt = 0; XrDuration last_period = 13888888; uint64_t xr_skips = 0, xr_ends = 0;   // S6: right-eye swapchain (xsc = left / mono)
     VkInstance vki = VK_NULL_HANDLE; PFN_vkGetInstanceProcAddr gipa = nullptr; VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkDevice dev = VK_NULL_HANDLE; VkCommandPool pool = VK_NULL_HANDLE; Slot slots[kSlots]; int slot = 0;
@@ -320,6 +336,14 @@ void load_ini() {
     g.hud_mode = (int)GetPrivateProfileIntA("vr", "hud_mode", 1, f.c_str()) % 3;
     g.hud_dist_cm = (int)GetPrivateProfileIntA("vr", "hud_dist_cm", 150, f.c_str()); if (g.hud_dist_cm < 50 || g.hud_dist_cm > 500) g.hud_dist_cm = 150;
     g.hud_sync = GetPrivateProfileIntA("vr", "hud_sync", 1, f.c_str()) ? 1 : 0;
+    auto clampi = [](int v, int lo, int hi, int d) { return v < lo || v > hi ? d : v; };
+    g.dlss_fix = GetPrivateProfileIntA("vr", "dlss_fix", 1, f.c_str()) ? 1 : 0; dlss_set_mode(g.dlss_fix ? 3 : 0);
+    vlog("[vr] dlss_fix=%d (1 = per-eye DLSS history + corrected motion vectors: removes stereo ghosting/halos)", g.dlss_fix);
+    g.post_sharp = clampi((int)GetPrivateProfileIntA("vr", "post_sharpen", 0, f.c_str()), 0, 100, 0);
+    g.post_contrast = clampi((int)GetPrivateProfileIntA("vr", "post_contrast", 100, f.c_str()), 50, 200, 100);
+    g.post_sat = clampi((int)GetPrivateProfileIntA("vr", "post_saturation", 100, f.c_str()), 0, 200, 100);
+    g.post_bright = clampi((int)GetPrivateProfileIntA("vr", "post_brightness", 100, f.c_str()), 50, 200, 100);
+    vlog("[vr] post: sharpen=%d%% contrast=%d%% saturation=%d%% brightness=%d%% (all neutral = bitwise copy, no pass)", g.post_sharp, g.post_contrast, g.post_sat, g.post_bright);
     vlog("[vr] hud_sync=%d (1 = HUD refreshed from LEFT-eye frames only: world prompts don't jump between eye projections)", g.hud_sync);
     vlog("[vr] hud_mode=%d (0 = in the game image, 1 = quad 55 deg, 2 = quad 70 deg) hud_dist_cm=%d", g.hud_mode, g.hud_dist_cm);
     g.cam_dist_pct = (int)GetPrivateProfileIntA("vr", "cam_dist_pct", 100, f.c_str()); if (g.cam_dist_pct < 20 || g.cam_dist_pct > 150) g.cam_dist_pct = 100;
@@ -344,6 +368,7 @@ void save_ini() {
     w("yaw_sign", g.ys); w("pitch_sign", g.ps); w("roll_sign", g.rsg); w("pose_lag", g.lag); w("head_tracking", g.tracking);
     w("stereo", g.stereo); w("ipd_pct", g.ipd_pct);
     w("fov_axis", g.fov_axis); w("fov_override", g.fov_ovr); w("fov_pct", g.fov_pct); w("fov_mode", g.fov_mode); w("head_mode", g.head_mode); w("head_pos", g.head_pos); w("head_look", g.head_look); w("pair_lock", g.pair_lock); w("pair_rate", g.pair_rate); w("cam_dist_pct", g.cam_dist_pct); w("mat_proj", g.mat_proj); w("layer_eyefov", g.layer_eyefov); w("hud_mode", g.hud_mode); w("hud_dist_cm", g.hud_dist_cm); w("hud_sync", g.hud_sync);
+    w("dlss_fix", g.dlss_fix); w("post_sharpen", g.post_sharp); w("post_contrast", g.post_contrast); w("post_saturation", g.post_sat); w("post_brightness", g.post_bright);
     { char hb[16]; snprintf(hb, sizeof(hb), "0x%x", g.fov_off_ini); WritePrivateProfileStringA("vr", "fov_off", hb, f.c_str()); }
     save_keys(f.c_str());
     g.ini_mtime = ini_mtime();   // our own write: not a reload trigger
@@ -416,9 +441,9 @@ const Act kActs[kNumActs] = {
     {"toggle_tracking", "Insert"}, {"recenter", "Home"}, {"yaw_sign", DEVKEY("PageUp")}, {"camobj_dump", DEVKEY("PageDown")},
     {"roll_mode", DEVKEY("End")}, {"pose_lag", DEVKEY("Pause")}, {"stereo_mode", "ScrollLock"}, {"ipd_up", "Num+"}, {"ipd_down", "Num-"},
     {"fov_toggle", "Num*"}, {"ipd_reset", "Num0"}, {"ipd_up_alt", "]"}, {"ipd_down_alt", "["}, {"fov_fill_fit", "Num/"},
-    {"head_look", "Num5"}, {"six_dof", "Num8"}, {"pitch_sign", DEVKEY("Num2")}, {"fov_hwbp", DEVKEY("Num9")},
+    {"head_look", "Num5"}, {"six_dof", "Num8"}, {"pitch_sign", "None"}, {"fov_hwbp", "None"},
     {"pair_lock", DEVKEY("Num7")}, {"pair_rate", DEVKEY("Num1")}, {"cam_closer", "Num4"}, {"cam_farther", "Num6"}, {"cam_reset", "Num3"},
-    {"hud_mode", "NumDel"}};
+    {"hud_mode", "NumDel"}, {"sharpen", "Num9"}, {"dlss_mode", "Num1"}, {"s12_dump", DEVKEY("Num2")}};
 void load_keys(const char* f) {
     char b[32];
     for (int i = 0; i < kNumActs; ++i) {
@@ -529,6 +554,18 @@ void hotkeys() {
 #endif
                  vlog("[vr] hud_mode %d", g.hud_mode);
                  osd("%s", g.hud_mode == 0 ? "HUD in game image" : g.hud_mode == 1 ? "HUD panel 55" DEG : "HUD panel 70" DEG); break;
+        case 24: { static const int lv[5] = {0, 25, 50, 75, 100}; int k = 0; while (k < 5 && lv[k] <= g.post_sharp) ++k;
+                 g.post_sharp = k >= 5 ? 0 : lv[k]; beep_async(g.post_sharp ? 1 + g.post_sharp / 25 : 1); save_ini();
+                 vlog("[vr] post_sharpen=%d", g.post_sharp); osd(g.post_sharp ? "Sharpening %d%%" : "Sharpening OFF", g.post_sharp); break; }
+        case 26: if (s12_dump_start(8)) { beep_async(1); osd("Camera dump (8 frames)"); } else { beep_async(5); } break;
+        case 25: { if (!dlss_ok()) { beep_async(5); osd("DLSS hook unavailable (game uses FSR/other AA?)"); break; }
+                 #ifdef EVR_PUBLIC
+                 int m = dlss_mode() == 3 ? 0 : 3;   // release: fix on/off only
+#else
+                 int m = (dlss_mode() + 1) % 4;      // dev: game / reset / per-eye MV x0 / per-eye + MV fix
+#endif
+                 dlss_set_mode(m); g.dlss_fix = m == 3; save_ini(); beep_async(m == 3 ? 2 : m + 1); vlog("[vr] dlss_mode %d", m);
+                 osd(m == 0 ? "DLSS stereo fix OFF (game default)" : m == 1 ? "DLSS: history reset every frame (test)" : m == 2 ? "DLSS: per-eye history, stand still (test)" : "DLSS stereo fix ON (per-eye history)"); break; }
         case 13: g.fov_axis = !g.fov_axis; beep_async(g.fov_axis ? 2 : 1); save_ini(); vlog("[vr] fov mode %s", g.fov_axis ? "FIT" : "FILL");
                  osd(g.fov_axis ? "FOV mode FIT (full width)" : "FOV mode FILL (full height)"); break;
         }
@@ -737,6 +774,13 @@ void xr_on_device(VkDevice dev, VkPhysicalDevice pd) {
     auto gdpa = (PFN_vkGetDeviceProcAddr)g.gipa(g.vki, "vkGetDeviceProcAddr");
 #define VLOAD(n) p_##n = (PFN_##n)gdpa(dev, #n); if (!p_##n) { vlog("[xr] missing %s", #n); g.active = false; return; }
     VK_FUNCS(VLOAD)
+    dlss_set_device((void*)dev);
+    { auto gpp = (PFN_vkGetPhysicalDeviceProperties)g.gipa(g.vki, "vkGetPhysicalDeviceProperties");
+      auto gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)g.gipa(g.vki, "vkGetPhysicalDeviceMemoryProperties");
+      VkPhysicalDeviceProperties pp{}; VkPhysicalDeviceMemoryProperties mp{}; if (gpp) gpp(pd, &pp); if (gmp) gmp(pd, &mp);
+      if (gmp && mvfix_init(dev, gdpa, mp, pp.limits.minStorageBufferOffsetAlignment))
+          dlss_set_pre([](void* cmd, void* ev, const float* c32, int ap) -> void* { return mvfix_pre((VkCommandBuffer)cmd, ev, c32, ap); },
+                       []() -> int { MvFixStats s; mvfix_stats(&s); return s.calibrated ? 1 : 0; }); }
     vlog("[xr] device %p bound", (void*)dev);
 }
 
@@ -884,6 +928,61 @@ bool make_hud(const GameSc& s) {
     VkImageView v; if (p_vkCreateImageView(g.dev, &vi, nullptr, &v) != VK_SUCCESS) return fail("image view");
     g.himg = img; g.hview = v; g.hw = s.w; g.hh = s.h; g.hud_seen = g_hud_passes.load();
     vlog("[hud] target %ux%u fmt %d + XR quad swapchain fmt %lld, %u images", s.w, s.h, (int)s.fmt, (long long)g.xfmt, n);
+    return true;
+}
+// v1.1.1 (S12): CAS + colour compute pass. Reads the game swapchain image as a storage image (GENERAL), writes pimg.
+// Needs STORAGE in the game swapchain usage (Enshrouded: 0x1d) and R8G8B8A8_UNORM; otherwise the plain copy stays.
+bool post_wanted() { return g.post_sharp || g.post_contrast != 100 || g.post_sat != 100 || g.post_bright != 100; }
+bool make_post(const GameSc& s) {
+    if (g.pfailed) return false;
+    if (g.ppipe && g.pimg && g.pw == s.w && g.ph == s.h && g.pkey == s.imgs[0] && g.pds.size() == s.imgs.size()) return true;
+    auto fail = [](const char* w) { vlog("[post] setup failed: %s -> plain copy (no sharpening/colour)", w); g.pfailed = true; return false; };
+    if (!(g_sc_usage & VK_IMAGE_USAGE_STORAGE_BIT)) return fail("game swapchain has no STORAGE usage");
+    if (s.fmt != VK_FORMAT_R8G8B8A8_UNORM || !g.xcopy) return fail("game format is not R8G8B8A8_UNORM");
+    if (!g.ppipe) {
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; smi.codeSize = sizeof(kPostComp); smi.pCode = kPostComp;
+        if (p_vkCreateShaderModule(g.dev, &smi, nullptr, &g.psm) != VK_SUCCESS) return fail("shader module");
+        VkDescriptorSetLayoutBinding bd[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dli.bindingCount = 2; dli.pBindings = bd;
+        if (p_vkCreateDescriptorSetLayout(g.dev, &dli, nullptr, &g.pdsl) != VK_SUCCESS) return fail("set layout");
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pli.setLayoutCount = 1; pli.pSetLayouts = &g.pdsl; pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+        if (p_vkCreatePipelineLayout(g.dev, &pli, nullptr, &g.ppl) != VK_SUCCESS) return fail("pipeline layout");
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, g.psm, "main", nullptr}; cpi.layout = g.ppl;
+        if (p_vkCreateComputePipelines(g.dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &g.ppipe) != VK_SUCCESS) { g.ppipe = VK_NULL_HANDLE; return fail("compute pipeline"); }
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32}; VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 16; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
+        if (p_vkCreateDescriptorPool(g.dev, &dpi, nullptr, &g.ppool) != VK_SUCCESS) return fail("descriptor pool");
+    }
+    if (s.imgs.empty() || s.imgs.size() > 8) return fail("swapchain image count");
+    // (re)build for this swapchain; the old intermediate image is leaked on resize like the HUD target (in-flight safety)
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = s.fmt; ii.extent = {s.w, s.h, 1};
+    ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage img; if (p_vkCreateImage(g.dev, &ii, nullptr, &img) != VK_SUCCESS) return fail("vkCreateImage");
+    VkMemoryRequirements mr; p_vkGetImageMemoryRequirements(g.dev, img, &mr);
+    auto gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)g.gipa(g.vki, "vkGetPhysicalDeviceMemoryProperties");
+    VkPhysicalDeviceMemoryProperties mp; gmp(g.pd, &mp); uint32_t mt = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && mt == UINT32_MAX; ++i) if ((mr.memoryTypeBits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) mt = i;
+    if (mt == UINT32_MAX) return fail("memory type");
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size; mai.memoryTypeIndex = mt;
+    VkDeviceMemory mem; if (p_vkAllocateMemory(g.dev, &mai, nullptr, &mem) != VK_SUCCESS || p_vkBindImageMemory(g.dev, img, mem, 0) != VK_SUCCESS) return fail("memory");
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = s.fmt; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.image = img; VkImageView ov; if (p_vkCreateImageView(g.dev, &vi, nullptr, &ov) != VK_SUCCESS) return fail("output view");
+    p_vkResetDescriptorPool(g.dev, g.ppool, 0);
+    std::vector<VkDescriptorSetLayout> ls(s.imgs.size(), g.pdsl); std::vector<VkDescriptorSet> ds(s.imgs.size());
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dai.descriptorPool = g.ppool; dai.descriptorSetCount = (uint32_t)ls.size(); dai.pSetLayouts = ls.data();
+    if (p_vkAllocateDescriptorSets(g.dev, &dai, ds.data()) != VK_SUCCESS) return fail("descriptor sets");
+    for (size_t k = 0; k < s.imgs.size(); ++k) {
+        vi.image = s.imgs[k]; VkImageView iv; if (p_vkCreateImageView(g.dev, &vi, nullptr, &iv) != VK_SUCCESS) return fail("input view");
+        VkDescriptorImageInfo di[2] = {{VK_NULL_HANDLE, iv, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, ov, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet wr[2]; for (int b = 0; b < 2; ++b) { wr[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr[b].dstSet = ds[k]; wr[b].dstBinding = b;
+            wr[b].descriptorCount = 1; wr[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; wr[b].pImageInfo = &di[b]; }
+        p_vkUpdateDescriptorSets(g.dev, 2, wr, 0, nullptr);
+    }
+    g.pimg = img; g.pview = ov; g.pw = s.w; g.ph = s.h; g.pkey = s.imgs[0]; g.pds = ds;
+    vlog("[post] compute pass ready: %ux%u, %zu game images (usage 0x%x)", s.w, s.h, s.imgs.size(), g_sc_usage);
     return true;
 }
 void poll_events() {
@@ -1123,6 +1222,7 @@ static VkSemaphore xr_on_present_impl(VkQueue q, const VkPresentInfoKHR* pi) {
     int eye_img = proj ? g.heye[us] : -1;                     // which eye the presented image was rendered for (-1 = mono)
     if (eye_img < 0) g.evalid[0] = g.evalid[1] = false;
     const bool pmode = pairing && eye_img >= 0;
+    if (eye_img >= 0 && dlss_ok()) { int ds = dlss_last_slot(); if (ds >= 0) { if (ds == eye_img) g.dlss_eq++; else g.dlss_ne++; } }
     const uint64_t pid = g.hpair[us];
     XrSwapchain tsc = eye_img == 1 ? g.xsc1 : (pmode && (pid & 1)) ? g.xsc2 : g.xsc;
     std::vector<VkImage>& timgs = eye_img == 1 ? g.ximgs1 : (pmode && (pid & 1)) ? g.ximgs2 : g.ximgs;
@@ -1149,6 +1249,24 @@ static VkSemaphore xr_on_present_impl(VkQueue q, const VkPresentInfoKHR* pi) {
             VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             p_vkBeginCommandBuffer(sl.cb, &cbi);
             VkImage src = s.imgs[gi], dst = timgs[xi];
+            const bool post = post_wanted() && make_post(s) && gi < g.pds.size();
+            if (post) {   // v1.1.1: game image (GENERAL, storage read) -> CAS/colour -> pimg; the copy below then reads pimg
+                barrier(sl.cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                barrier(sl.cb, g.pimg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,   // WAR vs last frame's copy
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                struct { float sharp, contrast, sat, gamma; int w, h; } pc{g.post_sharp / 100.f, g.post_contrast / 100.f, g.post_sat / 100.f,
+                                                                       100.f / (float)g.post_bright, (int)s.w, (int)s.h};
+                p_vkCmdBindPipeline(sl.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.ppipe);
+                p_vkCmdBindDescriptorSets(sl.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.ppl, 0, 1, &g.pds[gi], 0, nullptr);
+                p_vkCmdPushConstants(sl.cb, g.ppl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                p_vkCmdDispatch(sl.cb, (s.w + 7) / 8, (s.h + 7) / 8, 1);
+                barrier(sl.cb, src, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_SHADER_READ_BIT, 0,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                barrier(sl.cb, g.pimg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                src = g.pimg; g.post_frames++;
+            } else
             barrier(sl.cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             barrier(sl.cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1162,7 +1280,7 @@ static VkSemaphore xr_on_present_impl(VkQueue q, const VkPresentInfoKHR* pi) {
                 b.srcOffsets[1] = {(int32_t)s.w, (int32_t)s.h, 1}; b.dstOffsets[1] = {(int32_t)s.w, (int32_t)s.h, 1};
                 p_vkCmdBlitImage(sl.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
             }
-            barrier(sl.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0,
+            if (!post) barrier(sl.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             barrier(sl.cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -1385,6 +1503,16 @@ static VkSemaphore xr_on_present_impl(VkQueue q, const VkPresentInfoKHR* pi) {
           if (g.t_stat > 0) vlog("[vr] frame tags: exact=%llu fallback=%llu, builder pose age avg %.2f XR frames, lag=%d presents", (unsigned long long)g.tag_ok,
                                  (unsigned long long)g.tag_fb, g.seq_age_n ? double(g.seq_age_sum) / g.seq_age_n : -1.0, g.lag);
           g.tag_ok = g.tag_fb = g.seq_age_sum = g.seq_age_n = 0;
+          if (g.t_stat > 0 && dlss_ok()) { uint64_t dc, dr, dsw, df; float l[8]; dlss_stats(&dc, &dr, &dsw, &df, l);
+              vlog("[dlss] mode=%d evals=%llu resets=%llu swaps=%llu fails=%llu eye==slot %llu / != %llu | jitter %.3f %.3f mvscale %.1f %.1f reset %.0f out %.0fx%.0f",
+                   dlss_mode(), (unsigned long long)(dc - g.dlss_calls_prev), (unsigned long long)dr, (unsigned long long)dsw, (unsigned long long)df,
+                   (unsigned long long)g.dlss_eq, (unsigned long long)g.dlss_ne, l[0], l[1], l[2], l[3], l[4], l[5], l[6]);
+              g.dlss_calls_prev = dc; g.dlss_eq = g.dlss_ne = 0;
+              MvFixStats ms; mvfix_stats(&ms); uint64_t ma, mz; dlss_mv_stats(&ma, &mz);
+              vlog("[mvfix] calls=%llu calibs=%llu calibrated=%d conv=0x%02x applied=%llu zeroed=%llu | %s", (unsigned long long)ms.calls, (unsigned long long)ms.calibs,
+                   ms.calibrated, ms.conv & 0xff, (unsigned long long)ma, (unsigned long long)mz, ms.top); }
+          if (g.t_stat > 0 && post_wanted()) { vlog("[post] frames=%llu sharpen=%d contrast=%d sat=%d bright=%d%s", (unsigned long long)g.post_frames,
+                                 g.post_sharp, g.post_contrast, g.post_sat, g.post_bright, g.pfailed ? " (FAILED -> plain copy)" : ""); g.post_frames = 0; }
           if (g.t_stat > 0) vlog("[vr] pair_lock=%d head_look=%d pairs ok=%llu broken=%llu holds=%llu", g.pair_lock, g.head_look,
                                  (unsigned long long)g.pairs_ok, (unsigned long long)g.pairs_broken, (unsigned long long)g.pair_holds);
           if (g.t_stat > 0) vlog("[vr] pair_rate=%d presents=%llu xr frames=%llu skipped=%llu (%.1f XR fps, %.1f game fps)", g.pair_rate,

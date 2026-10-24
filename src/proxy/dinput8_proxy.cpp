@@ -22,9 +22,9 @@
 #include <unordered_map>
 
 #ifdef EVR_PUBLIC
-#define EVR_VERSION "1.1.0"
+#define EVR_VERSION "1.2.0"
 #else
-#define EVR_VERSION "1.1.0"
+#define EVR_VERSION "1.2.0"
 #endif
 #include "xr.h"
 
@@ -292,12 +292,14 @@ static VKAPI_ATTR void VKAPI_CALL Hk_GetDeviceQueue2(VkDevice d, const VkDeviceQ
 }
 
 void xr_window_force();
+extern uint32_t g_sc_usage;
 static VKAPI_ATTR VkResult VKAPI_CALL Hk_CreateSwapchain(VkDevice d, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* a, VkSwapchainKHR* out) {
     xr_window_force();
     VkSwapchainCreateInfoKHR mci = *ci;
     if (xr_active()) mci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;    // needed to copy the frame into the XR swapchain
     VkResult r = real_CreateSwapchain(d, &mci, a, out);
     if (r != VK_SUCCESS && mci.imageUsage != ci->imageUsage) { vlog("[xr] swapchain with TRANSFER_SRC failed (%d) -> retry plain", r); mci = *ci; r = real_CreateSwapchain(d, ci, a, out); }
+    if (r == VK_SUCCESS) g_sc_usage = mci.imageUsage;
     if (r == VK_SUCCESS) xr_on_swapchain(*out, ci->imageExtent.width, ci->imageExtent.height, ci->imageFormat, 0, nullptr);
     if (r == VK_SUCCESS && ci->imageExtent.height) g_backbuffer_aspect = float(ci->imageExtent.width) / float(ci->imageExtent.height);
     vlog("vkCreateSwapchainKHR %ux%u fmt=%d cs=%d usage=0x%x minImages=%u present=%d old=%p -> %d sc=%p",

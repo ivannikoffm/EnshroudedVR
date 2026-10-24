@@ -1,6 +1,6 @@
 # EnshroudedVR — play Enshrouded in real VR
 
-**Version 1.1.0** · free, open source (MIT) · by **ivannikoffm**
+**Version 1.2.0** · free, open source (MIT) · by **ivannikoffm**
 
 EnshroudedVR is an unofficial mod that runs Enshrouded on a PC VR headset with **true stereoscopic 3D**, a
 **head-tracked third-person camera** and the **full field of view of your headset**. You play with **keyboard and mouse**,
@@ -10,6 +10,8 @@ much like a UEVR "flat-to-VR" mod, with a natively rendered image instead of a 3
 - Head tracking turns the view around your character. The mouse still steers the game camera as usual.
 - Uses the full headset FOV, with the image fitted to each eye's lens. Asymmetric optics such as Quest 3 are handled correctly.
 - Optional 6DoF: lean in with your head.
+- **Clean stereo with DLSS/DLAA (new in 1.2.0):** each eye keeps its own DLSS history with corrected motion vectors, which removes the ghosting and halos around the character and objects.
+- Optional sharpening and colour controls (contrast, saturation, brightness) applied before the image reaches the headset.
 - A crisp head-locked **HUD panel** (55° for combat, 70° for exploring). Menus, inventory and map appear on a flat virtual screen with a working cursor.
 - An in-headset text message for every hotkey, a settings app with live apply, and rebindable keys.
 - No game files are changed. The mod works in memory only, and you remove it by deleting one file.
@@ -73,7 +75,7 @@ Tried another headset? Please report it, with `enshrouded_vr\vrlog.txt` attached
 
 ## 3. Installation
 
-1. Download `EnshroudedVR_v1.1.0.zip`.
+1. Download `EnshroudedVR_v1.2.0.zip`.
 2. Open the game folder: Steam → right-click Enshrouded → *Manage* → *Browse local files*.
    Usually it is `...\steamapps\common\Enshrouded\`, the folder that contains `enshrouded.exe`.
 3. Copy **`dinput8.dll`** and the **`enshrouded_vr`** folder into that folder. The result should be:
@@ -108,7 +110,7 @@ These settings make the biggest difference to sharpness and smoothness.
 | Setting | Recommended | Why |
 |---|---|---|
 | **Display Mode** | **Windowed** | Lets the mod render a **square 2160×2160 frame** (`force_window`). Headsets see an almost square field of view, so a 16:9 frame wastes more than half of its pixels. The square frame gives about **+33% sharpness for the same GPU cost**. |
-| Anti-aliasing / upscaler | **DLSS Quality** (or DLAA if you have headroom) | Keeps ≥72 fps. A missed frame is visible as a stutter in VR. |
+| Anti-aliasing / upscaler | **DLAA** if your GPU holds 72 fps, otherwise **DLSS Quality** | Keeps ≥72 fps. A missed frame is visible as a stutter in VR. With DLSS/DLAA the mod's stereo fix (`dlss_fix`) removes stereo ghosting; FSR/TAA are not covered by it. |
 | Automatic render scale | **Off** | Otherwise the game quietly lowers resolution (blur). |
 | Render scale | 100% | |
 | V-Sync | Off | The headset paces the game. |
@@ -179,6 +181,8 @@ All keys can be rebound in the settings app (*Keys* tab) or in `vr.ini` → `[ke
 | **Num8** | 6DoF head position on/off (lean in / out) |
 | **Insert** | Head tracking on/off |
 | **ScrollLock** | Stereo → swapped eyes → mono |
+| **Num1** | DLSS stereo fix on/off (2 beeps = on, 1 beep = off) |
+| **Num9** | Sharpening: off → 25 → 50 → 75 → 100% |
 | *(unbound)* | Advanced: pose lag, eye pair lock, yaw/pitch sign, roll mode, pair rate |
 
 The mod has no keys with **Ctrl**, because Ctrl is *sneak* in the game. The game's own **Z** (first-person view, used when
@@ -224,6 +228,9 @@ Values marked *advanced* are tuned for this game: leave them unless you are trou
 | `hud_mode` | `1` | `0` in image, `1` panel 55°, `2` panel 70° | HUD display (NumDel). The panel is head-locked at `hud_dist_cm`. |
 | `hud_dist_cm` | `150` | 50–500 | HUD panel distance. |
 | `hud_sync` | `1` | `1` / `0` | Update the HUD from one eye only. Stops doubled world prompts ("E — Pick up"). |
+| `dlss_fix` | `1` | `1` / `0` | DLSS/DLAA stereo fix (Num1): a separate DLSS history per eye plus motion vectors recomputed for that eye. Removes ghosting and halos. It calibrates itself in the first seconds; until then (or if the game does not use DLSS) the image is exactly the game's. Log line: `[mvfix] … calibrated=1`. |
+| `post_sharpen` | `0` | 0–100 | Sharpening (AMD CAS) of the final image (Num9). 0 = off. |
+| `post_contrast`, `post_saturation`, `post_brightness` | `100` | 50–200 (saturation 0–200) | Colour controls in %. All at 100 = untouched image, no extra pass. |
 | `pair_lock` | `1` | *advanced* | Show only complete left+right pairs rendered with the same head pose. Prevents double images when you turn your head. |
 | `pair_rate` | `0` | *advanced* | Alternative pacing for games running at ≥2× the headset rate. Keep 0. |
 | `pose_lag` | `2` | *advanced*, 0–3 | Frames between the head pose and the image it is applied to. |
@@ -275,6 +282,7 @@ Always look at `enshrouded_vr\vrlog.txt` first (the settings app has *Open log*)
 | Stutter or judder | The game fps is below the headset rate: use DLSS Quality or lower settings, set the headset to 72 Hz. On Air Link, lower the bitrate (Wi-Fi glitches). |
 | Square frame not applied (log: `force_window … Fullscreen mode -> ignored`) | Set the game's Display Mode to **Windowed**. |
 | Objects double when you turn your **head** | Make sure `pair_lock=1`. A higher IPD makes it more visible. |
+| Halos / ghosting around the character and objects | Use DLSS or DLAA and keep `dlss_fix=1` (Num1, 2 beeps). Check `[mvfix] … calibrated=1` in the log. With FSR/TAA the fix is not available. |
 | Fast-moving objects show slight ghosting | A limitation of alternating-eye rendering (§11). |
 | Depth looks wrong or "inside out" | ScrollLock, cycle back to normal stereo (swapped eyes may be active). |
 | World prompts ("E — Pick up") look doubled | `hud_sync=1`. |
@@ -289,7 +297,7 @@ Always look at `enshrouded_vr\vrlog.txt` first (the settings app has *Open log*)
 
 - **Alternate-eye rendering (AER).** The game renders the left and right eye on alternating frames. Each eye therefore updates
   at half the game fps (36 Hz at 72 fps), and fast-moving objects can show slight ghosting. The mod pairs frames carefully so
-  that static scenes and head turns are clean.
+  that static scenes and head turns are clean, and with DLSS/DLAA it keeps a separate DLSS history per eye (`dlss_fix`).
 - **No motion controllers.** Keyboard and mouse (or the game's gamepad support) only.
 - **The HUD** is drawn once (from one eye) on a head-locked panel. It is not stereoscopic.
 - **Square menus** with the square frame (the game lays out its UI to the frame shape). Use `force_window=2496x1872` (4:3) or
@@ -331,6 +339,11 @@ For the curious and for other modders.
   Frames alternate left/right (AER) and are submitted to the headset only as **complete pairs rendered with one head pose**.
 - **FOV:** the mod replaces the game's FOV at its source, so projection, DLSS/DLAA and motion vectors all agree. The
   projection layer is cut to each eye's own (possibly asymmetric) FOV.
+- **DLSS stereo fix:** with alternating eyes, the game's motion vectors point into the *other* eye's previous frame, so one
+  shared DLSS history blends both eyes (halos). The mod hooks the game's DLSS evaluate call, gives the right eye its own DLSS
+  feature and, before each call, a small compute shader rebuilds the motion vectors against the *same* eye two frames earlier
+  (from depth and the render cameras). The depth/axis conventions are found by self-calibration against the game's own
+  motion vectors (accepted below 1.5 px; typical 0.1–0.2 px).
 - **HUD:** the game's last render pass (UI only) is redirected into a transparent texture and shown as a head-locked quad.
 - **Square frame:** the mod subclasses the game window and keeps its client area at the configured size. It centres the window on the monitor
   and maps the menu cursor to the whole window.
@@ -345,6 +358,9 @@ Repository layout: `src/proxy/` (the DLL), `src/config/` (settings app), `src/th
   `src/proxy/build_public/dinput8.dll` (the release configuration, `/DEVR_PUBLIC`). `build.bat` builds the developer
   configuration with diagnostic hotkeys.
   Headers: Vulkan headers (`third_party/vulkan`) and OpenXR SDK headers (`third_party/openxr/include`).
+- **Shaders:** `src/proxy/shaders/*.comp` are compiled to SPIR-V with glslang and embedded as headers
+  (`python tools/spv2h.py src/proxy/shaders/mvfix.comp src/proxy/mvfix_comp.h kMvFixComp`). The generated headers are in
+  the repository, so glslang is only needed if you change a shader. GPU self-tests: `test_mvfix.bat`, `test_post.bat`, `test_dlss.bat`.
 - **OpenXR loader:** `openxr_loader.dll` from the Khronos OpenXR SDK (NuGet package `OpenXR.Loader`, 1.1.x, x64).
 - **Settings app:** `src/config/build.bat`, which uses the .NET Framework 4.8 `csc.exe` that ships with Windows (no SDK needed).
   Self-test: `EnshroudedVR-Config.exe --ini test.ini --selftest`.
@@ -356,6 +372,7 @@ Pull requests and issue reports are welcome. Please attach `vrlog.txt` and your 
 ## 16. Credits & license
 
 - Mod, research and code: **ivannikoffm**.
+- The DLSS evaluate-wrapper signature was first identified in momotori01's ENSHROUDED-VR-MOD (Unlicense) — thanks!
 - Thanks to the Flat2VR community and to the UEVR / VR modding playbook authors, whose work inspired the approach.
 - OpenXR loader © The Khronos Group Inc., Apache-2.0 OR MIT. See `THIRD_PARTY_NOTICES.txt`.
 - Enshrouded © Keen Games. This is a fan project, not affiliated with Keen Games.

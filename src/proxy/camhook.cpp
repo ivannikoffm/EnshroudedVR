@@ -10,6 +10,8 @@
 //   R*offset(0x148c..0x1494) - dist(0x14a4)*fwd. (research/dis_v1_*.txt)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
+#include <vector>
 #include <tlhelp32.h>
 #include <atomic>
 #include <cstdint>
@@ -193,6 +195,8 @@ void __fastcall view_mat2quat(float* dst, const float* m) {
     memcpy(t_mf, mf, sizeof(mf)); t_valid = true;
     g_mat2quat(dst, &mf[0][0]);
 }
+struct PosRec { double t; uint64_t seq; int64_t p[3]; float eye; uint32_t tid; };
+PosRec g_posring[32]; volatile LONG g_posn = 0;
 void __fastcall view_post(int64_t* out) {
     InterlockedIncrement64(&g_view_b);
     if (!t_valid) return;
@@ -204,6 +208,7 @@ void __fastcall view_post(int64_t* out) {
         float d = t_mf[0][k] * v.eye + t_mb[0][k] * v.hp[0] + t_mb[1][k] * v.hp[1] + t_mb[2][k] * (v.hp[2] + v.pull);
         out[k] += (int64_t)(d * 4294967296.0);
     }
+    { LONG i = InterlockedIncrement(&g_posn) & 31; PosRec& r = g_posring[i]; r.t = now_s(); r.seq = v.seq; r.p[0] = out[0]; r.p[1] = out[1]; r.p[2] = out[2]; r.eye = v.eye; r.tid = GetCurrentThreadId(); }
 }
 uint8_t* g_trampA = nullptr; uint8_t* g_trampB = nullptr; bool g_viewok = false;
 // S8b render-FOV hook (v1.0): 0x3a8a69 copies CamObj+0x20c4 -> frame camera record [r14+0x4c] (consumed by the renderer).
@@ -234,7 +239,114 @@ bool write_jmp(uint8_t* site, uint32_t len, uint8_t* target) {
     FlushInstructionCache(GetCurrentProcess(), site, len);
     return ok;
 }
+// ---- S12 (v1.1.2): DLSS evaluate wrapper (NGX_VULKAN_EVALUATE_DLSS_EXT, found by momotori01's observer; 1 caller 0x10048cf)
+// args: rcx VkCommandBuffer, rdx NVSDK_NGX_Handle* (ctx+0xe8), r8 NVSDK_NGX_Parameter* (ctx+0xe0), r9 eval params
+// (color +0, output +8, depth +0x18, MV +0x20, jitter +0x28/+0x2c, subrect +0x30, reset +0x38, MV scale +0x3c/+0x40).
+// Entry patch: 3 x 5-byte mov [rsp+x],reg (no rip-rel) -> 15 bytes displaced.
+const Sig kDlssSig = {"48 89 5c 24 08 48 89 6c 24 10 48 89 74 24 18 48 89 7c 24 20 41 56 48 83 ec 40 49 8b f8 49 8b d9 4d 8b 01 48 8b ea 4c 8b f1", 0xfa97c0};
+const uint32_t kDlssLen = 15;
+typedef int(__fastcall* DlssEval)(void*, void*, void*, void*);
+typedef int(__cdecl* NgxCreate1)(void* dev, void* cmd, int feature, void* params, void** out);
+DlssEval g_dlss_orig = nullptr; uint8_t* g_trampD = nullptr; bool g_dlssok = false;
+volatile LONG g_dlss_mode = 0;              // 0 game, 1 reset every eval, 2 per-eye + MV x0 (static test), 3 per-eye + corrected MV (S12 fix)
+typedef void* (*DlssPre)(void* cmd, void* evalp, const float* cam32, int apply); DlssPre g_dlss_pre = nullptr; int (*g_dlss_ready)() = nullptr; volatile LONG64 g_mv_applied = 0, g_mv_zero = 0;
+bool read_cam32(uint64_t pd, float* out) { __try { if (!pd) return false; memcpy(out, (void*)(pd - 0x40), 32 * 4); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+volatile LONG64 g_dlss_calls = 0, g_dlss_resets = 0, g_dlss_swaps = 0, g_dlss_fail = 0;
+void* g_dlss_dev = nullptr; void* g_dlss_game_h = nullptr; void* g_dlss_h2 = nullptr; NgxCreate1 g_ngx_create1 = nullptr;
+volatile LONG g_dlss_parity = 0, g_dlss_last_slot = -1; LONG g_dlss_prev_mode = 0; bool g_dlss_fresh2 = false;
+float g_dlss_last[8] = {};
+volatile LONG g_s12_left = 0; int g_s12_k = 0; std::vector<uint8_t> g_s12buf;
+void s12_res(std::vector<uint8_t>& b, uint8_t* r) {   // NVSDK_NGX_Resource_VK: view +0 image +8 ... format +0x24 w +0x28 h +0x2c type +0x30
+    uint8_t z[0x38] = {}; __try { if (r) memcpy(z, r, 0x38); } __except (EXCEPTION_EXECUTE_HANDLER) {} b.insert(b.end(), z, z + 0x38); }
+void s12_capture(void* evalp, LONG slot) {
+    // record: magic, t, slot, tid, eval[0x80], color/out/depth/mv resources, camera struct [proj_dst-0x40-0x400, +0x800), posring
+    std::vector<uint8_t>& b = g_s12buf; auto put = [&](const void* p, size_t n) { b.insert(b.end(), (const uint8_t*)p, (const uint8_t*)p + n); };
+    uint32_t mg = 0x31325331; put(&mg, 4); double t = now_s(); put(&t, 8); put(&slot, 4); DWORD tid = GetCurrentThreadId(); put(&tid, 4);
+    uint64_t pd = g_proj_dst; put(&pd, 8);
+    uint8_t ev[0x80] = {}; __try { memcpy(ev, evalp, 0x80); } __except (EXCEPTION_EXECUTE_HANDLER) {} put(ev, 0x80);
+    uint8_t* e = (uint8_t*)evalp; uint8_t* rr[4] = {}; __try { rr[0] = *(uint8_t**)e; rr[1] = *(uint8_t**)(e + 8); rr[2] = *(uint8_t**)(e + 0x18); rr[3] = *(uint8_t**)(e + 0x20); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    for (auto r : rr) s12_res(b, r);
+    uint8_t cs[0x800] = {}; __try { if (pd) memcpy(cs, (void*)(pd - 0x40 - 0x400), 0x800); } __except (EXCEPTION_EXECUTE_HANDLER) {} put(cs, 0x800);
+    put(g_posring, sizeof(g_posring)); LONG pn = g_posn; put(&pn, 4);
+}                  // jitter x,y, mv scale x,y, reset, out w,h, slot
+NgxCreate1 find_create1() {
+    HMODULE mods[512]; DWORD need = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) return nullptr;
+    for (DWORD i = 0; i < need / sizeof(HMODULE) && i < 512; ++i) {
+        if (mods[i] == GetModuleHandleA(nullptr)) continue;
+        if (auto f = (NgxCreate1)GetProcAddress(mods[i], "NVSDK_NGX_VULKAN_CreateFeature1")) {
+            char n[MAX_PATH] = {}; K32GetModuleBaseNameA(GetCurrentProcess(), mods[i], n, MAX_PATH); vlog("[dlss] CreateFeature1 from %s", n); return f; }
+    }
+    return nullptr;
+}
+int __fastcall dlss_eval_hook(void* cmd, void* handle, void* params, void* evalp) {
+    InterlockedIncrement64(&g_dlss_calls);
+    uint8_t* e = (uint8_t*)evalp; const LONG mode = g_dlss_mode;
+    __try {
+        uint8_t* out = *(uint8_t**)(e + 8);
+        g_dlss_last[0] = *(float*)(e + 0x28); g_dlss_last[1] = *(float*)(e + 0x2c); g_dlss_last[2] = *(float*)(e + 0x3c); g_dlss_last[3] = *(float*)(e + 0x40);
+        g_dlss_last[4] = (float)*(int32_t*)(e + 0x38); if (out) { g_dlss_last[5] = (float)*(uint32_t*)(out + 0x28); g_dlss_last[6] = (float)*(uint32_t*)(out + 0x2c); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_dlss_fail); return g_dlss_orig(cmd, handle, params, evalp); }
+    const LONG slot = InterlockedIncrement(&g_dlss_parity) & 1;   // AER: evals alternate L,R (alignment with the presented eye is logged by xr.cpp)
+    InterlockedExchange(&g_dlss_last_slot, slot); g_dlss_last[7] = (float)slot;
+    if (g_s12_left > 0) { s12_capture(evalp, slot); if (InterlockedDecrement(&g_s12_left) == 0) {
+        char fn[MAX_PATH]; GetModuleFileNameA(nullptr, fn, MAX_PATH); char* sl = strrchr(fn, '\\'); if (sl) sl[1] = 0;
+        char path[MAX_PATH]; snprintf(path, sizeof(path), "%senshrouded_vr\\s12dump_%d.bin", fn, ++g_s12_k);
+        FILE* f = nullptr; if (!fopen_s(&f, path, "wb") && f) { fwrite(g_s12buf.data(), 1, g_s12buf.size(), f); fclose(f); }
+        vlog("[s12] camera dump %s (%zu bytes)", path, g_s12buf.size()); g_s12buf.clear(); Beep(1200, 80); Sleep(60); Beep(1200, 80); Beep(1200, 80); } }
+    void* mvres = nullptr;
+    if (g_dlss_pre) { float cam32[32]; if (read_cam32(g_proj_dst, cam32)) mvres = g_dlss_pre(cmd, evalp, cam32, mode == 3 ? 1 : 0); }
+    // release mode 3: until the MV fix has calibrated (or if it never does - other AA/upscaler path) DLSS runs exactly as the game set it up
+    const LONG eff = (mode == 3 && !(g_dlss_ready && g_dlss_ready())) ? 0 : mode;
+    if (eff != g_dlss_prev_mode) { g_dlss_prev_mode = eff; g_dlss_fresh2 = true; }
+    if (mode == 1) { *(int32_t*)(e + 0x38) = 1; InterlockedIncrement64(&g_dlss_resets); }
+    if (eff == 2 || eff == 3) {
+        if (handle != g_dlss_game_h) { g_dlss_game_h = handle; g_dlss_h2 = nullptr; }   // game (re)created its feature -> ours follows
+        if (!g_dlss_h2 && g_dlss_dev) {
+            if (!g_ngx_create1) g_ngx_create1 = find_create1();
+            void* h2 = nullptr; int r = g_ngx_create1 ? g_ngx_create1(g_dlss_dev, cmd, 1 /*SuperSampling*/, params, &h2) : -1;
+            vlog("[dlss] second feature (right-eye history): result 0x%x handle %p", r, h2);
+            if (r == 1 && h2) { g_dlss_h2 = h2; g_dlss_fresh2 = true; } else { InterlockedExchange(&g_dlss_mode, 0); InterlockedIncrement64(&g_dlss_fail); }
+        }
+        if (g_dlss_h2) {
+            if (eff == 3 && mvres) InterlockedIncrement64(&g_mv_applied);
+            else { *(float*)(e + 0x3c) = 0.f; *(float*)(e + 0x40) = 0.f; InterlockedIncrement64(&g_mv_zero); }   // static test / not calibrated yet
+            if (g_dlss_fresh2) { *(int32_t*)(e + 0x38) = 1; if (slot) g_dlss_fresh2 = false; }
+            if (slot) { handle = g_dlss_h2; InterlockedIncrement64(&g_dlss_swaps); }
+        }
+    }
+    if (eff == 3 && mvres && g_dlss_h2) {   // corrected MVs (same eye, two frames ago) for this call only
+        void* orig_mv = *(void**)(e + 0x20); *(void**)(e + 0x20) = mvres;
+        int r = g_dlss_orig(cmd, handle, params, evalp);
+        *(void**)(e + 0x20) = orig_mv; return r;
+    }
+    return g_dlss_orig(cmd, handle, params, evalp);
+}
 } // namespace
+void dlss_set_pre(void* (*f)(void*, void*, const float*, int), int (*ready)()) { g_dlss_pre = f; g_dlss_ready = ready; }
+void dlss_mv_stats(uint64_t* applied, uint64_t* zeroed) { *applied = (uint64_t)g_mv_applied; *zeroed = (uint64_t)g_mv_zero; }
+
+void dlss_set_device(void* dev) { g_dlss_dev = dev; }
+bool s12_dump_start(int n) { if (!g_dlssok || g_s12_left > 0) return false; g_s12buf.reserve((size_t)n * 0xc00); InterlockedExchange(&g_s12_left, n); return true; }
+bool dlss_ok() { return g_dlssok; }
+void dlss_set_mode(int m) { InterlockedExchange(&g_dlss_mode, m); }
+int dlss_mode() { return g_dlss_mode; }
+int dlss_last_slot() { return g_dlss_last_slot; }
+void dlss_stats(uint64_t* calls, uint64_t* resets, uint64_t* swaps, uint64_t* fails, float* last8) {
+    *calls = (uint64_t)g_dlss_calls; *resets = (uint64_t)g_dlss_resets; *swaps = (uint64_t)g_dlss_swaps; *fails = (uint64_t)g_dlss_fail; memcpy(last8, g_dlss_last, sizeof(g_dlss_last)); }
+bool dlss_install_at(uint8_t* exe) {
+    int ld = 0; bool dd = false; uint32_t rd = find_sig(exe, kDlssSig, &ld, &dd);
+    if (!rd || dd) { vlog("[hook] dlss-eval hook: signature %s -> S12 DLSS modes unavailable", dd ? "AMBIGUOUS" : "not found"); return false; }
+    uint8_t* site = exe + rd;
+    g_trampD = (uint8_t*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_trampD) return false;
+    Emit em{g_trampD}; memcpy(em.p, site, kDlssLen); em.p += kDlssLen;
+    em.b({0xff, 0x25, 0, 0, 0, 0}); em.q((uint64_t)(site + kDlssLen));
+    g_dlss_orig = (DlssEval)g_trampD;
+    if (!write_jmp(site, kDlssLen, (uint8_t*)&dlss_eval_hook)) { vlog("[hook] dlss-eval hook: patch failed"); return false; }
+    g_dlssok = true; vlog("[hook] dlss-eval hook INSTALLED: site exe+0x%x", rd);
+    return true;
+}
 
 bool camhook_install_at(uint8_t* exe) {
     if (g_installed) return true;
@@ -356,7 +468,7 @@ bool camhook_install_at(uint8_t* exe) {
     return true;
 }
 
-bool camhook_install() { return camhook_install_at((uint8_t*)GetModuleHandleA(nullptr)); }
+bool camhook_install() { uint8_t* exe = (uint8_t*)GetModuleHandleA(nullptr); bool r = camhook_install_at(exe); dlss_install_at(exe); return r; }
 
 void camhook_uninstall() {
     if (!g_installed) return;

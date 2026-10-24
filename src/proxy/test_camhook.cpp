@@ -20,7 +20,7 @@ alignas(16) float xout[8];
 alignas(16) float cam[0x2000];
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* path = argc > 1 ? argv[1] : "E:\\SteamLibrary\\steamapps\\common\\Enshrouded\\enshrouded.exe";
+    const char* path = argc > 1 ? argv[1] : "enshrouded_v1.0_a07fae72.exe";   // RVAs below are v1.0; current exe is checked by tools/sigscan.py
     FILE* f = fopen(path, "rb"); if (!f) { printf("no exe\n"); return 1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     std::vector<uint8_t> file(sz); fread(file.data(), 1, sz, f); fclose(f);
